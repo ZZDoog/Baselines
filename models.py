@@ -1,100 +1,223 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions.normal import Normal
-from torch.distributions import kl_divergence
+from torch import nn
+from torch.nn import functional as F
 
-from functions import vq, vq_st
+class VectorQuantizer(nn.Module):
+    """
+    Reference:
+    [1] https://github.com/deepmind/sonnet/blob/v2/sonnet/src/nets/vqvae.py
+    """
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 beta: float = 0.25):
+        super(VectorQuantizer, self).__init__()
+        self.K = num_embeddings
+        self.D = embedding_dim
+        self.beta = beta
 
-# 模型权重
-def weights_init(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        try:
-            nn.init.xavier_uniform_(m.weight.data)
-            m.bias.data.fill_(0)
-        except AttributeError:
-            print("Skipping initialization of ", classname)
+        self.embedding = nn.Embedding(self.K, self.D)
+        self.embedding.weight.data.uniform_(-1 / self.K, 1 / self.K)
 
-class VQEmbedding(nn.Module):
-    def __init__(self, K, D):
-        super().__init__()
-        self.embedding = nn.Embedding(K, D)
-        self.embedding.weight.data.uniform_(-1./K, 1./K)
+    def forward(self, latents):
+        latents = latents.permute(0, 2, 3, 1).contiguous()  # [B x D x H x W] -> [B x H x W x D]
+        latents_shape = latents.shape
+        flat_latents = latents.view(-1, self.D)  # [BHW x D]
 
-    def forward(self, z_e_x):
-        z_e_x_ = z_e_x.permute(0, 2, 3, 1).contiguous()
-        latents = vq(z_e_x_, self.embedding.weight)
-        return latents
+        # Compute L2 distance between latents and embedding weights
+        dist = torch.sum(flat_latents ** 2, dim=1, keepdim=True) + \
+               torch.sum(self.embedding.weight ** 2, dim=1) - \
+               2 * torch.matmul(flat_latents, self.embedding.weight.t())  # [BHW x K]
 
-    def straight_through(self, z_e_x):
-        z_e_x_ = z_e_x.permute(0, 2, 3, 1).contiguous()
-        z_q_x_, indices = vq_st(z_e_x_, self.embedding.weight.detach())
-        z_q_x = z_q_x_.permute(0, 3, 1, 2).contiguous()
+        # Get the encoding that has the min distance
+        encoding_inds = torch.argmin(dist, dim=1).unsqueeze(1)  # [BHW, 1]
 
-        z_q_x_bar_flatten = torch.index_select(self.embedding.weight,
-            dim=0, index=indices)
-        z_q_x_bar_ = z_q_x_bar_flatten.view_as(z_e_x_)
-        z_q_x_bar = z_q_x_bar_.permute(0, 3, 1, 2).contiguous()
+        # Convert to one-hot encodings
+        device = latents.device
+        encoding_one_hot = torch.zeros(encoding_inds.size(0), self.K, device=device)
+        encoding_one_hot.scatter_(1, encoding_inds, 1)  # [BHW x K]
 
-        return z_q_x, z_q_x_bar
+        # Quantize the latents
+        quantized_latents = torch.matmul(encoding_one_hot, self.embedding.weight)  # [BHW, D]
+        quantized_latents = quantized_latents.view(latents_shape)  # [B x H x W x D]
+
+        # Compute the VQ Losses
+        commitment_loss = F.mse_loss(quantized_latents.detach(), latents)
+        embedding_loss = F.mse_loss(quantized_latents, latents.detach())
+
+        vq_loss = commitment_loss * self.beta + embedding_loss
+
+        # Add the residue back to the latents
+        quantized_latents = latents + (quantized_latents - latents).detach()
+
+        return quantized_latents.permute(0, 3, 1, 2).contiguous(), vq_loss  # [B x D x H x W]
+
+class ResidualLayer(nn.Module):
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int):
+        super(ResidualLayer, self).__init__()
+        self.resblock = nn.Sequential(nn.Conv2d(in_channels, out_channels,
+                                                kernel_size=3, padding=1, bias=False),
+                                      nn.ReLU(True),
+                                      nn.Conv2d(out_channels, out_channels,
+                                                kernel_size=1, bias=False))
+
+    def forward(self, input):
+        return input + self.resblock(input)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.ReLU(True),
-            nn.Conv2d(dim, dim, 3, 1, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.Conv2d(dim, dim, 1),
-            nn.BatchNorm2d(dim)
+class VQVAE(nn.modules):
+
+    def __init__(self,
+                 in_channels: int,
+                 embedding_dim: int,
+                 num_embeddings: int,
+                 hidden_dims = None,
+                 beta: float = 0.25,
+                 img_size: int = 64,
+                 **kwargs) -> None:
+        super(VQVAE, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.img_size = img_size
+        self.beta = beta
+
+        modules = []
+        if hidden_dims is None:
+            hidden_dims = [128, 256]
+
+        # Build Encoder
+        for h_dim in hidden_dims:
+            modules.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, out_channels=h_dim,
+                              kernel_size=4, stride=2, padding=1),
+                    nn.LeakyReLU())
+            )
+            in_channels = h_dim
+
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, in_channels,
+                          kernel_size=3, stride=1, padding=1),
+                nn.LeakyReLU())
         )
 
-    def forward(self, x):
-        return x + self.block(x)
+        for _ in range(6):
+            modules.append(ResidualLayer(in_channels, in_channels))
+        modules.append(nn.LeakyReLU())
 
-
-class VectorQuantizedVAE(nn.Module):
-    def __init__(self, input_dim, dim, K=512):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.Conv2d(dim, dim, 4, 2, 1),
-            ResBlock(dim),
-            ResBlock(dim),
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(in_channels, embedding_dim,
+                          kernel_size=1, stride=1),
+                nn.LeakyReLU())
         )
 
-        self.codebook = VQEmbedding(K, dim)
+        self.encoder = nn.Sequential(*modules)
 
-        self.decoder = nn.Sequential(
-            ResBlock(dim),
-            ResBlock(dim),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim, dim, 4, 2, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(dim, input_dim, 4, 2, 1),
-            nn.Tanh()
+        self.vq_layer = VectorQuantizer(num_embeddings,
+                                        embedding_dim,
+                                        self.beta)
+
+        # Build Decoder
+        modules = []
+        modules.append(
+            nn.Sequential(
+                nn.Conv2d(embedding_dim,
+                          hidden_dims[-1],
+                          kernel_size=3,
+                          stride=1,
+                          padding=1),
+                nn.LeakyReLU())
         )
 
-        self.apply(weights_init)
+        for _ in range(6):
+            modules.append(ResidualLayer(hidden_dims[-1], hidden_dims[-1]))
 
-    def encode(self, x):
-        z_e_x = self.encoder(x)
-        latents = self.codebook(z_e_x)
-        return latents
+        modules.append(nn.LeakyReLU())
 
-    def decode(self, latents):
-        z_q_x = self.codebook.embedding(latents).permute(0, 3, 1, 2)  # (B, D, H, W)
-        x_tilde = self.decoder(z_q_x)
-        return x_tilde
+        hidden_dims.reverse()
 
-    def forward(self, x):
-        z_e_x = self.encoder(x)
-        z_q_x_st, z_q_x = self.codebook.straight_through(z_e_x)
-        x_tilde = self.decoder(z_q_x_st)
-        return x_tilde, z_e_x, z_q_x
+        for i in range(len(hidden_dims) - 1):
+            modules.append(
+                nn.Sequential(
+                    nn.ConvTranspose2d(hidden_dims[i],
+                                       hidden_dims[i + 1],
+                                       kernel_size=4,
+                                       stride=2,
+                                       padding=1),
+                    nn.LeakyReLU())
+            )
+
+        modules.append(
+            nn.Sequential(
+                nn.ConvTranspose2d(hidden_dims[-1],
+                                   out_channels=3,
+                                   kernel_size=4,
+                                   stride=2, padding=1),
+                nn.Tanh()))
+
+        self.decoder = nn.Sequential(*modules)
+
+    def encode(self, input):
+        """
+        Encodes the input by passing through the encoder network
+        and returns the latent codes.
+        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
+        :return: (Tensor) List of latent codes
+        """
+        result = self.encoder(input)
+        return [result]
+
+    def decode(self, z):
+        """
+        Maps the given latent codes
+        onto the image space.
+        :param z: (Tensor) [B x D x H x W]
+        :return: (Tensor) [B x C x H x W]
+        """
+
+        result = self.decoder(z)
+        return result
+
+    def forward(self, input, **kwargs):
+        encoding = self.encode(input)[0]
+        quantized_inputs, vq_loss = self.vq_layer(encoding)
+        return [self.decode(quantized_inputs), input, vq_loss]
+
+    def loss_function(self,
+                      *args,
+                      **kwargs) -> dict:
+        """
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        recons = args[0]
+        input = args[1]
+        vq_loss = args[2]
+
+        recons_loss = F.mse_loss(recons, input)
+
+        loss = recons_loss + vq_loss
+        return {'loss': loss,
+                'Reconstruction_Loss': recons_loss,
+                'VQ_Loss':vq_loss}
+
+    def sample(self,
+               num_samples: int,
+               current_device, **kwargs):
+        raise Warning('VQVAE sampler is not implemented.')
+
+    def generate(self, x, **kwargs):
+        """
+        Given an input image x, returns the reconstructed image
+        :param x: (Tensor) [B x C x H x W]
+        :return: (Tensor) [B x C x H x W]
+        """
+
+        return self.forward(x)[0]
