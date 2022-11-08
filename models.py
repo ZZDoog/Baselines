@@ -1,6 +1,11 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import numpy as np
+
+from fast_transformers.builders import TransformerEncoderBuilder
+from fast_transformers.builders import RecurrentEncoderBuilder
+from fast_transformers.masking import TriangularCausalMask
 
 class VectorQuantizer(nn.Module):
     """
@@ -70,117 +75,88 @@ class ResidualLayer(nn.Module):
 
 class VQVAE(nn.modules):
 
-    def __init__(self,
-                 in_channels: int,
-                 embedding_dim: int,
-                 num_embeddings: int,
-                 hidden_dims = None,
-                 beta: float = 0.25,
-                 img_size: int = 64,
-                 **kwargs) -> None:
+    def __init__(self, n_token, codebook_szie, codebook_dim, beta):
+        # n_token: compound word 中各个属性的种类数量
+        # codebook_size: 离散化后codebook中向量的个数
+        # codebook_dim: 离散化后codebook中每个向量的维度
+        # beta: 计算离散化loss的一个超参数
         super(VQVAE, self).__init__()
 
-        self.embedding_dim = embedding_dim
-        self.num_embeddings = num_embeddings
-        self.img_size = img_size
+        self.d_model = 512
+        self.codebook_size = codebook_szie
+        self.codebook_dim = codebook_dim
         self.beta = beta
 
-        modules = []
-        if hidden_dims is None:
-            hidden_dims = [128, 256]
+        # 将CompoundWord中的各个元素词嵌入
+        self.emb_sizes = [128, 256, 64, 32, 512, 128, 128]
+
+        self.word_emb_tempo     = nn.Embedding(self.n_token[0], self.emb_sizes[0])
+        self.word_emb_chord     = nn.Embedding(self.n_token[1], self.emb_sizes[1])
+        self.word_emb_barbeat   = nn.Embedding(self.n_token[2], self.emb_sizes[2])
+        self.word_emb_type      = nn.Embedding(self.n_token[3], self.emb_sizes[3])
+        self.word_emb_pitch     = nn.Embedding(self.n_token[4], self.emb_sizes[4])
+        self.word_emb_duration  = nn.Embedding(self.n_token[5], self.emb_sizes[5])
+        self.word_emb_velocity  = nn.Embedding(self.n_token[6], self.emb_sizes[6])
+
+        self.input_linear = nn.Linear(np.sum(self.emb_sizes), self.d_model)
+
+        self.proj_tempo    = nn.Linear(self.d_model, self.n_token[0])        
+        self.proj_chord    = nn.Linear(self.d_model, self.n_token[1])
+        self.proj_barbeat  = nn.Linear(self.d_model, self.n_token[2])
+        self.proj_type     = nn.Linear(self.d_model, self.n_token[3])
+        self.proj_pitch    = nn.Linear(self.d_model, self.n_token[4])
+        self.proj_duration = nn.Linear(self.d_model, self.n_token[5])
+        self.proj_velocity = nn.Linear(self.d_model, self.n_token[6])
+
 
         # Build Encoder
-        for h_dim in hidden_dims:
-            modules.append(
-                nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels=h_dim,
-                              kernel_size=4, stride=2, padding=1),
-                    nn.LeakyReLU())
-            )
-            in_channels = h_dim
-
-        modules.append(
-            nn.Sequential(
-                nn.Conv2d(in_channels, in_channels,
-                          kernel_size=3, stride=1, padding=1),
-                nn.LeakyReLU())
-        )
-
-        for _ in range(6):
-            modules.append(ResidualLayer(in_channels, in_channels))
-        modules.append(nn.LeakyReLU())
-
-        modules.append(
-            nn.Sequential(
-                nn.Conv2d(in_channels, embedding_dim,
-                          kernel_size=1, stride=1),
-                nn.LeakyReLU())
-        )
-
-        self.encoder = nn.Sequential(*modules)
-
-        self.vq_layer = VectorQuantizer(num_embeddings,
-                                        embedding_dim,
+        self.encoder = nn.LSTM(input_size=self.d_model, hidden_size=self.d_model, 
+                                bath_first=True)
+        
+        # The VectorQuantizer Layer
+        self.vq_layer = VectorQuantizer(self.codebook_size,
+                                        self.codebook_dim,
                                         self.beta)
 
         # Build Decoder
-        modules = []
-        modules.append(
-            nn.Sequential(
-                nn.Conv2d(embedding_dim,
-                          hidden_dims[-1],
-                          kernel_size=3,
-                          stride=1,
-                          padding=1),
-                nn.LeakyReLU())
-        )
-
-        for _ in range(6):
-            modules.append(ResidualLayer(hidden_dims[-1], hidden_dims[-1]))
-
-        modules.append(nn.LeakyReLU())
-
-        hidden_dims.reverse()
-
-        for i in range(len(hidden_dims) - 1):
-            modules.append(
-                nn.Sequential(
-                    nn.ConvTranspose2d(hidden_dims[i],
-                                       hidden_dims[i + 1],
-                                       kernel_size=4,
-                                       stride=2,
-                                       padding=1),
-                    nn.LeakyReLU())
-            )
-
-        modules.append(
-            nn.Sequential(
-                nn.ConvTranspose2d(hidden_dims[-1],
-                                   out_channels=3,
-                                   kernel_size=4,
-                                   stride=2, padding=1),
-                nn.Tanh()))
-
-        self.decoder = nn.Sequential(*modules)
+        self.decoder = nn.LSTM(input_size=self.d_model, hidden_size=self.d_model, 
+                                bath_first=True)
 
     def encode(self, input):
         """
         Encodes the input by passing through the encoder network
         and returns the latent codes.
-        :param input: (Tensor) Input tensor to encoder [N x C x H x W]
-        :return: (Tensor) List of latent codes
         """
-        result = self.encoder(input)
-        return [result]
+        # embeddings
+        emb_tempo =    self.word_emb_tempo(input[..., 0])
+        emb_chord =    self.word_emb_chord(input[..., 1])
+        emb_barbeat =  self.word_emb_barbeat(input[..., 2])
+        emb_type =     self.word_emb_type(input[..., 3])
+        emb_pitch =    self.word_emb_pitch(input[..., 4])
+        emb_duration = self.word_emb_duration(input[..., 5])
+        emb_velocity = self.word_emb_velocity(input[..., 6])
+        
+        embs = torch.cat(
+            [
+                emb_tempo,
+                emb_chord,
+                emb_barbeat,
+                emb_type,
+                emb_pitch,
+                emb_duration,
+                emb_velocity,
+            ], dim=-1)
+        
+        emb_linear = self.input_linear(embs)
+        encoder_output = self.encoder(emb_linear)
+
+        return encoder_output
 
     def decode(self, z):
         """
         Maps the given latent codes
         onto the image space.
-        :param z: (Tensor) [B x D x H x W]
-        :return: (Tensor) [B x C x H x W]
         """
-
         result = self.decoder(z)
         return result
 
