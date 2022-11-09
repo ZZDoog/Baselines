@@ -73,7 +73,7 @@ class ResidualLayer(nn.Module):
         return input + self.resblock(input)
 
 
-class VQVAE(nn.modules):
+class VQVAE(nn.Module):
 
     def __init__(self, n_token, codebook_szie, codebook_dim, beta):
         # n_token: compound word 中各个属性的种类数量
@@ -83,6 +83,7 @@ class VQVAE(nn.modules):
         super(VQVAE, self).__init__()
 
         self.d_model = 512
+        self.n_token = n_token
         self.codebook_size = codebook_szie
         self.codebook_dim = codebook_dim
         self.beta = beta
@@ -111,7 +112,7 @@ class VQVAE(nn.modules):
 
         # Build Encoder
         self.encoder = nn.LSTM(input_size=self.d_model, hidden_size=self.d_model, 
-                                bath_first=True)
+                                batch_first=True)
         
         # The VectorQuantizer Layer
         self.vq_layer = VectorQuantizer(self.codebook_size,
@@ -120,13 +121,14 @@ class VQVAE(nn.modules):
 
         # Build Decoder
         self.decoder = nn.LSTM(input_size=self.d_model, hidden_size=self.d_model, 
-                                bath_first=True)
+                                batch_first=True)
 
     def encode(self, input):
         """
         Encodes the input by passing through the encoder network
         and returns the latent codes.
         """
+
         # embeddings
         emb_tempo =    self.word_emb_tempo(input[..., 0])
         emb_chord =    self.word_emb_chord(input[..., 1])
