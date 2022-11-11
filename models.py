@@ -3,9 +3,6 @@ from torch import nn
 from torch.nn import functional as F
 import numpy as np
 
-from fast_transformers.builders import TransformerEncoderBuilder
-from fast_transformers.builders import RecurrentEncoderBuilder
-from fast_transformers.masking import TriangularCausalMask
 
 class VectorQuantizer(nn.Module):
     """
@@ -25,9 +22,9 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1 / self.K, 1 / self.K)
 
     def forward(self, latents):
-        latents = latents.permute(0, 2, 3, 1).contiguous()  # [B x D x H x W] -> [B x H x W x D]
+        
         latents_shape = latents.shape
-        flat_latents = latents.view(-1, self.D)  # [BHW x D]
+        flat_latents = latents.contiguous().view(-1, self.D)  # [BL x D]
 
         # Compute L2 distance between latents and embedding weights
         dist = torch.sum(flat_latents ** 2, dim=1, keepdim=True) + \
@@ -35,7 +32,7 @@ class VectorQuantizer(nn.Module):
                2 * torch.matmul(flat_latents, self.embedding.weight.t())  # [BHW x K]
 
         # Get the encoding that has the min distance
-        encoding_inds = torch.argmin(dist, dim=1).unsqueeze(1)  # [BHW, 1]
+        encoding_inds = torch.argmin(dist, dim=1).unsqueeze(1)  # [BL, 1]
 
         # Convert to one-hot encodings
         device = latents.device
@@ -43,8 +40,8 @@ class VectorQuantizer(nn.Module):
         encoding_one_hot.scatter_(1, encoding_inds, 1)  # [BHW x K]
 
         # Quantize the latents
-        quantized_latents = torch.matmul(encoding_one_hot, self.embedding.weight)  # [BHW, D]
-        quantized_latents = quantized_latents.view(latents_shape)  # [B x H x W x D]
+        quantized_latents = torch.matmul(encoding_one_hot, self.embedding.weight)  # [B x L, D]
+        quantized_latents = quantized_latents.view(latents_shape)  # [B x L x D]
 
         # Compute the VQ Losses
         commitment_loss = F.mse_loss(quantized_latents.detach(), latents)
@@ -55,7 +52,7 @@ class VectorQuantizer(nn.Module):
         # Add the residue back to the latents
         quantized_latents = latents + (quantized_latents - latents).detach()
 
-        return quantized_latents.permute(0, 3, 1, 2).contiguous(), vq_loss  # [B x D x H x W]
+        return quantized_latents, vq_loss  # [B x D x H x W]
 
 class ResidualLayer(nn.Module):
 
@@ -75,7 +72,7 @@ class ResidualLayer(nn.Module):
 
 class VQVAE(nn.Module):
 
-    def __init__(self, n_token, codebook_szie, codebook_dim, beta):
+    def __init__(self,batch_size, n_token, codebook_szie, codebook_dim, beta, hop_size=32):
         # n_token: compound word 中各个属性的种类数量
         # codebook_size: 离散化后codebook中向量的个数
         # codebook_dim: 离散化后codebook中每个向量的维度
@@ -83,10 +80,14 @@ class VQVAE(nn.Module):
         super(VQVAE, self).__init__()
 
         self.d_model = 512
+        self.batch_szie = batch_size
         self.n_token = n_token
         self.codebook_size = codebook_szie
         self.codebook_dim = codebook_dim
         self.beta = beta
+        self.encoder_hop = hop_size
+        self.len = 3584
+        self.loss_func = nn.CrossEntropyLoss()
 
         # 将CompoundWord中的各个元素词嵌入
         self.emb_sizes = [128, 256, 64, 32, 512, 128, 128]
@@ -123,6 +124,16 @@ class VQVAE(nn.Module):
         self.decoder = nn.LSTM(input_size=self.d_model, hidden_size=self.d_model, 
                                 batch_first=True)
 
+        
+        self.encoder_mask = torch.zeros(self.batch_szie, self.len, self.d_model)
+        for idx_song in range(self.batch_szie):
+            for i in range(self.len):
+                if i % 30 == 0:
+                    self.encoder_mask[idx_song][i] = torch.ones(self.d_model)
+
+
+        
+
     def encode(self, input):
         """
         Encodes the input by passing through the encoder network
@@ -151,6 +162,7 @@ class VQVAE(nn.Module):
         
         emb_linear = self.input_linear(embs)
         encoder_output = self.encoder(emb_linear)
+        encoder_output = encoder_output*self.encoder_mask
 
         return encoder_output
 
@@ -159,32 +171,45 @@ class VQVAE(nn.Module):
         Maps the given latent codes
         onto the image space.
         """
-        result = self.decoder(z)
-        return result
+        output, (h_n, c_n) = self.decoder(z)
+        return output
 
-    def forward(self, input, **kwargs):
+    def forward(self, input):
+
         encoding = self.encode(input)[0]
         quantized_inputs, vq_loss = self.vq_layer(encoding)
-        return [self.decode(quantized_inputs), input, vq_loss]
+        decoder_output = self.decode(quantized_inputs)
 
-    def loss_function(self,
-                      *args,
-                      **kwargs) -> dict:
-        """
-        :param args:
-        :param kwargs:
-        :return:
-        """
-        recons = args[0]
-        input = args[1]
-        vq_loss = args[2]
+        output_tempo    = self.proj_tempo    (decoder_output)        
+        output_chord    = self.proj_chord    (decoder_output)
+        output_barbeat  = self.proj_barbeat  (decoder_output)
+        output_type     = self.proj_type     (decoder_output)
+        output_pitch    = self.proj_pitch    (decoder_output)
+        output_duration = self.proj_duration (decoder_output)
+        output_velocity = self.proj_velocity (decoder_output)
 
-        recons_loss = F.mse_loss(recons, input)
+        # loss
+        loss_tempo = self.loss_func(
+                output_tempo, input[..., 0])
+        loss_chord = self.loss_func(
+                output_chord, input[..., 1])
+        loss_barbeat = self.loss_func(
+                output_barbeat, input[..., 2])
+        loss_type = self.loss_func(
+                output_type,  input[..., 3])
+        loss_pitch = self.loss_func(
+                output_pitch, input[..., 4])
+        loss_duration = self.loss_func(
+                output_duration, input[..., 5])
+        loss_velocity = self.loss_func(
+                output_velocity, input[..., 6])
 
-        loss = recons_loss + vq_loss
-        return {'loss': loss,
-                'Reconstruction_Loss': recons_loss,
-                'VQ_Loss':vq_loss}
+        loss_rec = loss_tempo + loss_chord + loss_barbeat + loss_type + loss_pitch + loss_duration + loss_velocity
+        loss_rec = loss_rec / 7
+
+        return [decoder_output, input, loss_rec, vq_loss]
+
+
 
     def sample(self,
                num_samples: int,

@@ -48,7 +48,7 @@ def train():
     print('num of classes:', n_class)
 
     # init the model
-    model = VQVAE(n_token=n_class, codebook_szie=512, codebook_dim=512, beta=0.1)
+    model = VQVAE(batch_size=batch_size, n_token=n_class, codebook_szie=512, codebook_dim=512, beta=0.1)
     model.cuda()
     model.train()
 
@@ -61,22 +61,23 @@ def train():
     print('    train_x:', train_x.shape)
     print('    train_y:', train_y.shape)
 
-    for bidx in range(num_batch):
-         # index
-        bidx_st = batch_size * bidx
-        bidx_ed = batch_size * (bidx + 1)
+    strat_time = time.time()
+    for epoch in range(4000):
+        
+        for bidx in range(num_batch):
+            # index
+            bidx_st = batch_size * bidx
+            bidx_ed = batch_size * (bidx + 1)
 
-        # unpack batch data
-        batch_x = train_x[bidx_st:bidx_ed]
-        batch_y = train_y[bidx_st:bidx_ed]
+            # unpack batch data
+            batch_x = train_x[bidx_st:bidx_ed]
+            batch_y = train_y[bidx_st:bidx_ed]
 
-        # to tensor
-        batch_x = torch.from_numpy(batch_x).long().cuda()
-        batch_y = torch.from_numpy(batch_y).long().cuda()
+            # to tensor
+            batch_x = torch.from_numpy(batch_x).long().cuda()
+            batch_y = torch.from_numpy(batch_y).long().cuda()
     
-        output = model.encoder(batch_x)
 
-        loss = output-batch_x
 
 
 
