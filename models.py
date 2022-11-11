@@ -125,7 +125,8 @@ class VQVAE(nn.Module):
                                 batch_first=True)
 
         
-        self.encoder_mask = torch.zeros(self.batch_szie, self.len, self.d_model)
+        self.encoder_mask = torch.zeros([self.batch_szie, self.len, self.d_model], 
+                                        requires_grad=False).cuda()
         for idx_song in range(self.batch_szie):
             for i in range(self.len):
                 if i % 30 == 0:
@@ -161,7 +162,7 @@ class VQVAE(nn.Module):
             ], dim=-1)
         
         emb_linear = self.input_linear(embs)
-        encoder_output = self.encoder(emb_linear)
+        encoder_output, (h_out, c_out) = self.encoder(emb_linear)
         encoder_output = encoder_output*self.encoder_mask
 
         return encoder_output
@@ -176,7 +177,7 @@ class VQVAE(nn.Module):
 
     def forward(self, input):
 
-        encoding = self.encode(input)[0]
+        encoding = self.encode(input)
         quantized_inputs, vq_loss = self.vq_layer(encoding)
         decoder_output = self.decode(quantized_inputs)
 
@@ -190,24 +191,24 @@ class VQVAE(nn.Module):
 
         # loss
         loss_tempo = self.loss_func(
-                output_tempo, input[..., 0])
+                output_tempo.permute(0, 2, 1), input[..., 0])
         loss_chord = self.loss_func(
-                output_chord, input[..., 1])
+                output_chord.permute(0, 2, 1), input[..., 1])
         loss_barbeat = self.loss_func(
-                output_barbeat, input[..., 2])
+                output_barbeat.permute(0, 2, 1), input[..., 2])
         loss_type = self.loss_func(
-                output_type,  input[..., 3])
+                output_type.permute(0, 2, 1),  input[..., 3])
         loss_pitch = self.loss_func(
-                output_pitch, input[..., 4])
+                output_pitch.permute(0, 2, 1), input[..., 4])
         loss_duration = self.loss_func(
-                output_duration, input[..., 5])
+                output_duration.permute(0, 2, 1), input[..., 5])
         loss_velocity = self.loss_func(
-                output_velocity, input[..., 6])
+                output_velocity.permute(0, 2, 1), input[..., 6])
 
         loss_rec = loss_tempo + loss_chord + loss_barbeat + loss_type + loss_pitch + loss_duration + loss_velocity
         loss_rec = loss_rec / 7
 
-        return [decoder_output, input, loss_rec, vq_loss]
+        return decoder_output, input, loss_rec, vq_loss
 
 
 
