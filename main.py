@@ -30,7 +30,7 @@ path_test_data = os.path.join(path_data_root, 'test_data_linear.npz')
 path_dictionary =  os.path.join(path_data_root, 'dictionary.pkl')
 path_exp = 'exp_log'
 
-gid = 1
+gid = 0
 os.environ['CUDA_VISIBLE_DEVICES'] = str(gid)
 
 def network_paras(model):
@@ -74,7 +74,7 @@ def train():
         ' > params amount: {:,d}'.format(n_parameters))
 
     # optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     # unpack
     train_x = train_data['x']           # shape : 1625*3584*7
@@ -172,10 +172,10 @@ def train():
 
         # save model, with policy
         loss = epoch_loss
-        if 0.4 < loss <= 0.8:
+        if 0.5 < loss <= 1.0:
             fn = int(loss * 10) * 10
             saver_agent.save_model(model, name='loss_' + str(fn))
-        elif 0.05 < loss <= 0.40:
+        elif 0.05 < loss <= 0.5:
             fn = int(loss * 100)
             saver_agent.save_model(model, name='loss_' + str(fn))
         elif loss <= 0.05:

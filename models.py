@@ -178,6 +178,7 @@ class VQVAE(nn.Module):
     def forward(self, input):
 
         encoding = self.encode(input)
+        
         quantized_inputs, vq_loss = self.vq_layer(encoding)
         decoder_output = self.decode(quantized_inputs)
 
