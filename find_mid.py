@@ -1,4 +1,5 @@
 import os
+import sys
 
 import numpy as np
 import utils
@@ -39,9 +40,10 @@ def midi2remi(file_path):
 if __name__ == '__main__':
 
     # load the midi list
-    midi_list = np.load('midi_list.npy')
+    midi_list = np.load('Giant_piano_midi_list.npy')
 
-    event = midi2remi(midi_list[0])
+    # path = '/home/zhangzhedong/Giant_midi_piano'
+    # dirlist, midi_list = get_all_midi2(path)
 
     # Our parameters
     pitch_range = range(21, 109)
@@ -53,12 +55,27 @@ if __name__ == '__main__':
                         'tempo_range': (40, 250)}  # (min, max)
 
     tokenizer = REMI(pitch_range, beat_res, nb_velocities, additional_tokens, mask=True)
-    midi = MidiFile(midi_list[0])
 
-    tokens = tokenizer.midi_to_tokens(midi)
-    events = tokenizer.tokens_to_events(tokens[0])
+    sum_token = 0
+    max_token = 0
 
+    # average token:14824.316173, max token:472507
+    for i in range(len(midi_list)):
+        midi = MidiFile(midi_list[i])
+        tokens = tokenizer.midi_to_tokens(midi)
+        if len(tokens) != 1:
+            print(i)
+            print(midi_list[i])
+        
+        else:
+            sum_token += len(tokens[0])
+            if len(tokens[0]) > max_token:
+                max_token = len(tokens[0])
 
+        sys.stdout.write('{}/{}, average token:{:02f}, max token:{} \r'.format(i+1, len(midi_list), sum_token/(i+1), max_token))
+        sys.stdout.flush
+    
+    
 
     print('done')
 
